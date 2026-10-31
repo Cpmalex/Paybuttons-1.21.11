@@ -1,0 +1,655 @@
+name: Build paybuttons 1.21.11
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.4.1
+
+      - name: Generate project files
+        run: |
+          mkdir -p src/main/java/com/example/paybuttons src/main/resources
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'paybuttons'
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=1.21.11
+          loader_version=0.18.4
+          fabric_version=0.141.6+1.21.11
+
+          mod_version=1.21.11
+          maven_group=com.example
+          archives_base_name=paybuttons
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.15-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings loom.officialMojangMappings()
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "paybuttons",
+            "version": "${version}",
+            "name": "paybuttons 1.21.11",
+            "description": "Adds payback, 2x and X buttons to payment messages.",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.example.paybuttons.PayButtonsClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.18.1",
+              "minecraft": "1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+          cat > src/main/java/com/example/paybuttons/PayButtonsClient.java <<'EOF'
+          package com.example.paybuttons;
+
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+          import net.minecraft.ChatFormatting;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.components.ChatComponent;
+          import net.minecraft.network.chat.ClickEvent;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.network.chat.HoverEvent;
+          import net.minecraft.network.chat.MutableComponent;
+          import org.slf4j.Logger;
+          import org.slf4j.LoggerFactory;
+
+          import java.math.BigDecimal;
+          import java.lang.reflect.Constructor;
+          import java.lang.reflect.Field;
+          import java.lang.reflect.Method;
+          import java.lang.reflect.ParameterizedType;
+          import java.lang.reflect.Type;
+          import java.lang.reflect.RecordComponent;
+          import java.util.ArrayDeque;
+          import java.util.LinkedHashMap;
+          import java.util.LinkedHashSet;
+          import java.util.List;
+          import java.util.Map;
+          import java.util.concurrent.atomic.AtomicInteger;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public class PayButtonsClient implements ClientModInitializer {
+
+              // Matches: ".Jamestus3850 paid you $ 10M" (tolerant of symbols/spaces before the number)
+              private static final Pattern PAID = Pattern.compile(
+                      "(\\.?\\w{1,16}) paid you\\W*?([\\d,]*\\.?\\d+)\\s*([KMBTkmbt]?)");
+              private static final Logger LOGGER = LoggerFactory.getLogger("paybuttons");
+
+              // Delay between the two payments in [2x] (ticks, 20 ticks = 1 second)
+              private static final int DELAY_TICKS = 10;
+
+              // Every payment line carries a button whose command ends with this token + its id
+              private static final String TOKEN = "paybuttons_lost ";
+
+              private record Payment(Component original, String name, String amount) { }
+
+              private static final AtomicInteger NEXT_ID = new AtomicInteger(1);
+
+              // Recent payments (original line without buttons). Keeps the most recent 500.
+              private static final Map<Integer, Payment> PAYMENTS = new LinkedHashMap<>() {
+                  @Override
+                  protected boolean removeEldestEntry(Map.Entry<Integer, Payment> eldest) {
+                      return size() > 500;
+                  }
+              };
+
+              // Payments not acted on yet, oldest first. The first one is labelled "Current - ".
+              private static final LinkedHashSet<Integer> PENDING = new LinkedHashSet<>();
+              private static int currentId = -1;
+
+              // Queue of /pay commands still to send (first goes out next tick, rest are spaced out)
+              private static final ArrayDeque<String> QUEUE = new ArrayDeque<>();
+              private static int queueTicks = 0;
+
+              private static Runnable pendingScreen = null;
+              private static boolean announced = false;
+
+              @Override
+              public void onInitializeClient() {
+                  // ---- Add buttons to payment messages ----
+                  ClientReceiveMessageEvents.MODIFY_GAME.register((message, overlay) -> {
+                      if (overlay) return message;
+
+                      String raw = message.getString().trim();
+                      Matcher m = PAID.matcher(raw);
+                      if (!m.find()) {
+                          if (raw.contains("paid you")) {
+                              LOGGER.info("paid-you message did not match: [{}]", raw);
+                              return message.copy().append(
+                                      Component.literal(" [PB: seen, no match]").withStyle(ChatFormatting.RED));
+                          }
+                          return message;
+                      }
+
+                      String name = m.group(1);
+                      String amount = m.group(2).replace(",", "") + m.group(3).toUpperCase();
+                      int id = NEXT_ID.getAndIncrement();
+                      Payment payment = new Payment(message, name, amount);
+
+                      // Drop pending payments whose lines have scrolled out of chat, then re-label if needed
+                      try {
+                          List<Object> all = history();
+                          if (all != null) {
+                              final List<Object> hist = all;
+                              PENDING.removeIf(pid -> {
+                                  try {
+                                      return indexOf(hist, TOKEN + pid) < 0;
+                                  } catch (Exception e) {
+                                      return false;
+                                  }
+                              });
+                              if (currentId != -1 && !PENDING.contains(currentId)) {
+                                  currentId = -1;
+                                  promoteNext(hist);
+                              }
+                          }
+                      } catch (Throwable t) {
+                          LOGGER.warn("Could not prune pending payments", t);
+                      }
+
+                      // The first pending payment gets the "Current - " label
+                      boolean current = currentId == -1;
+                      PAYMENTS.put(id, payment);
+                      PENDING.add(id);
+                      if (current) currentId = id;
+
+                      return buildLine(id, payment, current);
+                  });
+
+                  // ---- Client commands used by the buttons ----
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+                      dispatcher.register(ClientCommandManager.literal("paybuttons_confirm")
+                              .then(ClientCommandManager.argument("type", StringArgumentType.word())
+                                      .then(ClientCommandManager.argument("name", StringArgumentType.word())
+                                              .then(ClientCommandManager.argument("amount", StringArgumentType.word())
+                                                      .then(ClientCommandManager.argument("id", StringArgumentType.word())
+                                                              .executes(ctx -> {
+                                                                  String type = StringArgumentType.getString(ctx, "type");
+                                                                  String name = StringArgumentType.getString(ctx, "name");
+                                                                  String amount = StringArgumentType.getString(ctx, "amount");
+                                                                  String id = StringArgumentType.getString(ctx, "id");
+                                                                  // Open the GUI on the next tick (a chat click closes screens)
+                                                                  pendingScreen = () -> openConfirm(type, name, amount, id);
+                                                                  return 1;
+                                                              }))))));
+
+                      dispatcher.register(ClientCommandManager.literal("paybuttons_lost")
+                              .then(ClientCommandManager.argument("id", StringArgumentType.word())
+                                      .executes(ctx -> {
+                                          String idStr = StringArgumentType.getString(ctx, "id");
+                                          String tag = " - Lost";
+                                          try {
+                                              Payment p = PAYMENTS.get(Integer.parseInt(idStr));
+                                              if (p != null) tag = " - " + p.name() + " lost " + p.amount();
+                                          } catch (NumberFormatException ignored) {
+                                              // keep the plain tag
+                                          }
+                                          tagMessage(idStr, tag, ChatFormatting.RED);
+                                          return 1;
+                                      })));
+                  });
+
+                  // ---- Per-tick work ----
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      if (pendingScreen != null) {
+                          Runnable r = pendingScreen;
+                          pendingScreen = null;
+                          r.run();
+                      }
+
+                      if (client.player == null) {
+                          announced = false;
+                          QUEUE.clear();
+                          PENDING.clear();
+                          currentId = -1;
+                      } else if (!announced) {
+                          announced = true;
+                          notice("[PayButtons] loaded", ChatFormatting.GREEN);
+                      }
+
+                      if (!QUEUE.isEmpty() && --queueTicks <= 0) {
+                          String cmd = QUEUE.poll();
+                          if (client.getConnection() != null) {
+                              client.getConnection().sendCommand(cmd);
+                          }
+                          queueTicks = DELAY_TICKS;
+                      }
+                  });
+              }
+
+              // ---------- Building a payment line ----------
+
+              private static Component buildLine(int id, Payment p, boolean current) {
+                  String tail = " " + p.name() + " " + p.amount() + " " + id;
+
+                  MutableComponent out = Component.literal("");
+                  if (current) {
+                      out.append(Component.literal("Current - ").withStyle(ChatFormatting.AQUA));
+                  }
+                  out.append(p.original().copy());
+                  out.append(Component.literal(" "));
+                  out.append(button("[payback]", ChatFormatting.GREEN,
+                          "/paybuttons_confirm payback" + tail,
+                          "Pay " + p.name() + " " + p.amount() + " (asks to confirm)"));
+                  out.append(Component.literal(" "));
+                  out.append(button("[2x]", ChatFormatting.GOLD,
+                          "/paybuttons_confirm twice" + tail,
+                          "Pay " + p.name() + " " + doubleAmount(p.amount()) + " (double, asks to confirm)"));
+                  out.append(Component.literal(" "));
+                  out.append(button("[X]", ChatFormatting.RED,
+                          "/" + TOKEN + id,
+                          "Mark this payment as lost"));
+                  return out;
+              }
+
+              // ---------- Confirmation GUI ----------
+
+              private static void openConfirm(String type, String name, String amount, String id) {
+                  Minecraft mc = Minecraft.getInstance();
+
+                  boolean twice = type.equals("twice");
+                  String payAmount = twice ? doubleAmount(amount) : amount;
+                  if (payAmount == null) {
+                      notice("[PayButtons] Can't double the amount \"" + amount + "\"", ChatFormatting.RED);
+                      return;
+                  }
+
+                  String title = twice ? "confirm 2x payment" : "confirm payment";
+                  String amountText = twice ? payAmount + "  (" + amount + " x 2)" : payAmount;
+                  String note = twice ? "this pays double what you received." : "this pays back what you received.";
+
+                  mc.setScreen(new ConfirmPaymentScreen(title, name, amountText, note, yes -> {
+                      mc.setScreen(null);
+                      if (!yes) return;
+
+                      sendPay(name, payAmount, 1);
+
+                      // Tag the payment line after confirming
+                      if (twice) {
+                          tagMessage(id, " - " + name + " Won " + payAmount, ChatFormatting.GOLD);
+                      } else {
+                          tagMessage(id, " - Payedback " + payAmount, ChatFormatting.GREEN);
+                      }
+                  }));
+              }
+
+              // "2M" -> "4M", "1.5B" -> "3B", "500K" -> "1M", "10" -> "20". Returns null if it can't parse.
+              private static String doubleAmount(String amount) {
+                  Matcher m = Pattern.compile("^([\\d.]+)([KMBT]?)$").matcher(amount.toUpperCase());
+                  if (!m.matches()) return null;
+                  try {
+                      String[] units = {"", "K", "M", "B", "T"};
+                      int i = java.util.Arrays.asList(units).indexOf(m.group(2));
+                      BigDecimal v = new BigDecimal(m.group(1)).multiply(BigDecimal.valueOf(2));
+                      while (v.compareTo(BigDecimal.valueOf(1000)) >= 0 && i < units.length - 1) {
+                          v = v.movePointLeft(3);
+                          i++;
+                      }
+                      return v.stripTrailingZeros().toPlainString() + units[i];
+                  } catch (NumberFormatException e) {
+                      return null;
+                  }
+              }
+
+              private static void sendPay(String name, String amount, int times) {
+                  boolean wasEmpty = QUEUE.isEmpty();
+                  String cmd = "pay " + name + " " + amount;
+                  for (int i = 0; i < times; i++) {
+                      QUEUE.add(cmd);
+                  }
+                  if (wasEmpty) queueTicks = 0; // first payment goes out on the next tick
+              }
+
+              // ---------- Tag a payment line, then move "Current - " to the next pending one ----------
+
+              private static void tagMessage(String idStr, String tag, ChatFormatting color) {
+                  int id;
+                  try {
+                      id = Integer.parseInt(idStr);
+                  } catch (NumberFormatException e) {
+                      return;
+                  }
+
+                  try {
+                      Object chat = Minecraft.getInstance().gui.getChat();
+                      List<Object> all = findAllMessages(chat);
+                      if (all == null) {
+                          notice("[PayButtons] Could not access chat history", ChatFormatting.RED);
+                          return;
+                      }
+
+                      int idx = indexOf(all, TOKEN + id);
+                      if (idx < 0) {
+                          notice("[PayButtons] That payment is no longer in the chat history", ChatFormatting.RED);
+                          return;
+                      }
+
+                      Object gm = all.get(idx);
+                      Component content = contentOf(gm);
+                      // Rebuild from the original line so "Current - " and the buttons are removed
+                      Payment p = PAYMENTS.get(id);
+                      Component base = p != null ? p.original() : content;
+                      all.set(idx, withContent(gm, base.copy().append(Component.literal(tag).withStyle(color))));
+
+                      boolean wasCurrent = id == currentId;
+                      PENDING.remove(id);
+                      if (wasCurrent) {
+                          currentId = -1;
+                          promoteNext(all);
+                      }
+                      refreshChat(chat);
+                  } catch (Throwable t) {
+                      LOGGER.warn("Could not tag payment", t);
+                      notice("[PayButtons] Could not mark it (see log)", ChatFormatting.RED);
+                  }
+              }
+
+              // Give "Current - " to the oldest pending payment that is still in chat
+              private static void promoteNext(List<Object> all) throws Exception {
+                  while (!PENDING.isEmpty()) {
+                      int next = PENDING.iterator().next();
+                      Payment p = PAYMENTS.get(next);
+                      int idx = indexOf(all, TOKEN + next);
+                      if (idx >= 0 && p != null) {
+                          Object gm = all.get(idx);
+                          all.set(idx, withContent(gm, buildLine(next, p, true)));
+                          currentId = next;
+                          return;
+                      }
+                      PENDING.remove(next);
+                  }
+                  currentId = -1;
+              }
+
+              // ---------- Chat history helpers (reflection keeps them independent of internal names) ----------
+
+              private static List<Object> history() throws Exception {
+                  Object chat = Minecraft.getInstance().gui.getChat();
+                  return findAllMessages(chat);
+              }
+
+              private static int indexOf(List<Object> all, String token) throws Exception {
+                  for (int i = 0; i < all.size(); i++) {
+                      Component c = contentOf(all.get(i));
+                      if (c != null && hasCommand(c, token)) return i;
+                  }
+                  return -1;
+              }
+
+              private static boolean hasCommand(Component c, String token) {
+                  ClickEvent ev = c.getStyle().getClickEvent();
+                  if (ev instanceof ClickEvent.RunCommand rc && rc.command().endsWith(token)) return true;
+                  for (Component sibling : c.getSiblings()) {
+                      if (hasCommand(sibling, token)) return true;
+                  }
+                  return false;
+              }
+
+              @SuppressWarnings("unchecked")
+              private static List<Object> findAllMessages(Object chat) throws Exception {
+                  for (Field f : chat.getClass().getDeclaredFields()) {
+                      if (!List.class.isAssignableFrom(f.getType())) continue;
+                      if (!(f.getGenericType() instanceof ParameterizedType pt)) continue;
+                      Type arg = pt.getActualTypeArguments()[0];
+                      if (!(arg instanceof Class<?> c) || !c.isRecord()) continue;
+                      for (RecordComponent rc : c.getRecordComponents()) {
+                          if (rc.getType() == Component.class) {
+                              f.setAccessible(true);
+                              return (List<Object>) f.get(chat);
+                          }
+                      }
+                  }
+                  return null;
+              }
+
+              private static Component contentOf(Object gm) throws Exception {
+                  for (RecordComponent rc : gm.getClass().getRecordComponents()) {
+                      if (rc.getType() == Component.class) {
+                          Method acc = rc.getAccessor();
+                          acc.setAccessible(true);
+                          return (Component) acc.invoke(gm);
+                      }
+                  }
+                  return null;
+              }
+
+              private static Object withContent(Object gm, Component content) throws Exception {
+                  RecordComponent[] rcs = gm.getClass().getRecordComponents();
+                  Class<?>[] types = new Class<?>[rcs.length];
+                  Object[] args = new Object[rcs.length];
+                  for (int i = 0; i < rcs.length; i++) {
+                      types[i] = rcs[i].getType();
+                      Method acc = rcs[i].getAccessor();
+                      acc.setAccessible(true);
+                      args[i] = types[i] == Component.class ? content : acc.invoke(gm);
+                  }
+                  Constructor<?> ctor = gm.getClass().getDeclaredConstructor(types);
+                  ctor.setAccessible(true);
+                  return ctor.newInstance(args);
+              }
+
+              private static void refreshChat(Object chat) {
+                  ((ChatComponent) chat).rescaleChat();
+              }
+
+              // ---------- Helpers ----------
+
+              private static void notice(String text, ChatFormatting color) {
+                  Minecraft mc = Minecraft.getInstance();
+                  if (mc.player != null) {
+                      mc.player.sendSystemMessage(Component.literal(text).withStyle(color));
+                  }
+              }
+
+              private static Component button(String label, ChatFormatting color, String command, String hover) {
+                  return Component.literal(label).withStyle(style -> style
+                          .withColor(color)
+                          .withBold(true)
+                          .withClickEvent(new ClickEvent.RunCommand(command))
+                          .withHoverEvent(new HoverEvent.ShowText(Component.literal(hover))));
+              }
+          }
+          EOF
+          cat > src/main/java/com/example/paybuttons/ConfirmPaymentScreen.java <<'EOF'
+          package com.example.paybuttons;
+
+          import net.minecraft.client.gui.GuiGraphics;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          import java.util.function.Consumer;
+
+          /**
+           * Dark confirmation panel:
+           *   title / "to <name>" / "amount <amount>" (red) / note / [confirm] [cancel]
+           *
+           * Visuals are drawn by hand; transparent vanilla buttons sit on top of the drawn
+           * buttons to receive the clicks.
+           */
+          public class ConfirmPaymentScreen extends Screen {
+
+              private static final int PW = 240;   // panel width
+              private static final int PH = 128;   // panel height
+              private static final int BW = 100;   // button width
+              private static final int BH = 22;    // button height
+
+              private static final int ACCENT = 0xFFFFAA00;
+              private static final int GREEN = 0xFF22DD44;
+              private static final int GRAY = 0xFF4A4A4A;
+
+              private final String titleText;
+              private final String name;
+              private final String amount;
+              private final String note;
+              private final Consumer<Boolean> result;
+
+              private int px, py;          // panel top-left
+              private int cx, cy;          // confirm button
+              private int kx, ky;          // cancel button
+              private int xx, xy;          // close "x"
+
+              public ConfirmPaymentScreen(String titleText, String name, String amount, String note,
+                                          Consumer<Boolean> result) {
+                  super(Component.literal(titleText));
+                  this.titleText = titleText;
+                  this.name = name;
+                  this.amount = amount;
+                  this.note = note;
+                  this.result = result;
+              }
+
+              @Override
+              protected void init() {
+                  px = (this.width - PW) / 2;
+                  py = (this.height - PH) / 2;
+
+                  cx = px + 14;
+                  kx = px + PW - 14 - BW;
+                  cy = py + PH - BH - 14;
+                  ky = cy;
+                  xx = px + 8;
+                  xy = py + 8;
+
+                  addRenderableWidget(hitBox(cx, cy, BW, BH, () -> result.accept(true)));
+                  addRenderableWidget(hitBox(kx, ky, BW, BH, () -> result.accept(false)));
+                  addRenderableWidget(hitBox(xx - 2, xy - 2, 14, 14, () -> result.accept(false)));
+              }
+
+              // Invisible button used only to catch clicks
+              private static Button hitBox(int x, int y, int w, int h, Runnable action) {
+                  Button b = Button.builder(Component.empty(), btn -> action.run())
+                          .bounds(x, y, w, h)
+                          .build();
+                  b.setAlpha(0f);
+                  return b;
+              }
+
+              @Override
+              public void render(GuiGraphics g, int mouseX, int mouseY, float delta) {
+                  super.render(g, mouseX, mouseY, delta);
+
+                  // Panel
+                  g.fill(px, py, px + PW, py + PH, 0xF2101010);
+                  border(g, px, py, PW, PH, 0xFF2C2C2C);
+                  g.fill(px, py, px + PW, py + 2, ACCENT);
+
+                  // Close "x"
+                  boolean overX = inside(mouseX, mouseY, xx - 2, xy - 2, 14, 14);
+                  g.drawString(this.font, "x", xx + 2, xy + 1, overX ? 0xFFFFFFFF : 0xFFAAAAAA);
+
+                  // Title
+                  centered(g, titleText, px + PW / 2, py + 10, 0xFFFFFFFF);
+
+                  // Rows
+                  g.drawString(this.font, "to", px + 20, py + 34, 0xFF9A9A9A);
+                  g.drawString(this.font, name, px + 74, py + 34, 0xFFFFFFFF);
+                  g.drawString(this.font, "amount", px + 20, py + 50, 0xFF9A9A9A);
+                  g.drawString(this.font, amount, px + 74, py + 50, 0xFFFF5555);
+
+                  // Note
+                  centered(g, note, px + PW / 2, py + 76, 0xFFCFCFCF);
+
+                  // Buttons
+                  drawButton(g, cx, cy, "confirm", GREEN, GREEN, inside(mouseX, mouseY, cx, cy, BW, BH));
+                  drawButton(g, kx, ky, "cancel", GRAY, 0xFFFFFFFF, inside(mouseX, mouseY, kx, ky, BW, BH));
+              }
+
+              private void drawButton(GuiGraphics g, int x, int y, String label,
+                                      int outline, int textColor, boolean hover) {
+                  g.fill(x, y, x + BW, y + BH, hover ? 0xFF1E1E1E : 0xFF0C0C0C);
+                  border(g, x, y, BW, BH, outline);
+                  int tx = x + (BW - this.font.width(label)) / 2;
+                  g.drawString(this.font, label, tx, y + (BH - 8) / 2, textColor);
+              }
+
+              private void centered(GuiGraphics g, String s, int centerX, int y, int color) {
+                  g.drawString(this.font, s, centerX - this.font.width(s) / 2, y, color);
+              }
+
+              private static void border(GuiGraphics g, int x, int y, int w, int h, int color) {
+                  g.fill(x, y, x + w, y + 1, color);
+                  g.fill(x, y + h - 1, x + w, y + h, color);
+                  g.fill(x, y, x + 1, y + h, color);
+                  g.fill(x + w - 1, y, x + w, y + h, color);
+              }
+
+              private static boolean inside(int mx, int my, int x, int y, int w, int h) {
+                  return mx >= x && mx < x + w && my >= y && my < y + h;
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle build --no-daemon
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: paybuttons-1.21.11
+          path: build/libs/*.jar
